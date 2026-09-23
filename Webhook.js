@@ -70,7 +70,7 @@ function checkDuplicate(ticketId, ratingLabel) {
 const BOT_UA_PATTERNS = [
     'safebrowsing', 'linkscanner', 'proofpoint', 'mimecast',
     'barracuda', 'symantec', 'sophos', 'ironport', 'qualys',
-    'outlook', 'preview', 'crawler', 'spider', 'bot'
+    'preview', 'crawler', 'spider', 'bot'
 ];
  
 function isBotRequest(req) {
