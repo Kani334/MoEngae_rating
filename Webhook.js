@@ -78,6 +78,10 @@ function isBotRequest(req) {
     return BOT_UA_PATTERNS.some(p => ua.includes(p));
 }
 
+app.get('/', (req, res) => {
+    res.status(200).send('MoEngage rating webhook is running.');
+});
+
 async function getLatestAgentInteraction(ticketId) {
     const conversationsResponse = await axios.get(
         `https://${FRESHDESK_DOMAIN}/api/v2/tickets/${ticketId}/conversations?per_page=100`,
