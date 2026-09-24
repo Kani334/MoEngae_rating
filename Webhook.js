@@ -227,6 +227,12 @@ function buildAutoClosePage(message, isAlreadyRated = false, rating = 0) {
       <div class="msg">${message}</div>
             <div class="sub">Your feedback has been recorded.</div>
     </div>
+        <script>
+            setTimeout(() => {
+                window.open('', '_self');
+                window.close();
+            }, 1500);
+        </script>
   </body>
 </html>`;
 }
