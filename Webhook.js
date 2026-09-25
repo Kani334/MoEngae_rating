@@ -63,21 +63,22 @@ const RATING_MAP = {
  
 // ── Deduplication: suppress duplicate requests for the same ticket within this window ──
 const DEDUP_WINDOW_MS = 10_000; // 10 seconds
-const dedupLocks = new Map();  // ticketId → { ts, ratingLabel }
+const dedupLocks = new Map();  // ticketId:interactionId:rating → timestamp
+const activeRatingRequests = new Set();
  
 // Returns null if not a duplicate (and registers the lock).
 // Returns the stored ratingLabel if this is a duplicate within the window.
-function checkDuplicate(ticketId, ratingLabel) {
+function checkDuplicate(ticketId, interactionId, ratingLabel) {
     const now = Date.now();
-    if (dedupLocks.has(ticketId)) {
-        const entry = dedupLocks.get(ticketId);
-        if (now - entry.ts < DEDUP_WINDOW_MS && entry.ratingLabel === ratingLabel) {
-            return entry.ratingLabel; // duplicate — return what was originally submitted
+    const dedupKey = `${ticketId}:${interactionId}:${ratingLabel}`;
+    if (dedupLocks.has(dedupKey)) {
+        const timestamp = dedupLocks.get(dedupKey);
+        if (now - timestamp < DEDUP_WINDOW_MS) {
+            return ratingLabel; // duplicate — return what was originally submitted
         }
     }
-    // Not a duplicate — register this request
-    dedupLocks.set(ticketId, { ts: now, ratingLabel });
-    setTimeout(() => dedupLocks.delete(ticketId), DEDUP_WINDOW_MS + 500);
+    dedupLocks.set(dedupKey, now);
+    setTimeout(() => dedupLocks.delete(dedupKey), DEDUP_WINDOW_MS + 500);
     return null;
 }
  
@@ -116,19 +117,19 @@ async function getLatestAgentInteraction(ticketId) {
     const conversations = Array.isArray(conversationsResponse.data)
         ? conversationsResponse.data
         : conversationsResponse.data?.conversations || [];
-    const agentReplies = conversations
+    const agentInteractions = conversations
         .filter(conversation => conversation.private === false && conversation.incoming !== true)
         .sort((first, second) => new Date(first.created_at) - new Date(second.created_at));
-    const latestAgentReply = agentReplies[agentReplies.length - 1];
+    const latestAgentInteraction = agentInteractions[agentInteractions.length - 1];
 
-    const interactionId = Number(latestAgentReply?.id);
+    const interactionId = Number(latestAgentInteraction?.id);
     if (!Number.isInteger(interactionId)) {
         throw new Error(`No agent reply found for ticket ${ticketId}`);
     }
 
     return {
         interactionId,
-        interactionNumber: agentReplies.length
+        interactionNumber: agentInteractions.length
     };
 }
 
@@ -174,6 +175,9 @@ async function saveCustomObjectRecord(payload, existingRecord = null) {
         return updateResponse.data;
     }
 
+    let interactionId;
+    let interactionNumber;
+    let ratingRequestKey;
     try {
         const createResponse = await axios.post(recordsUrl, payload, requestConfig);
         return createResponse.data;
@@ -284,15 +288,6 @@ app.get('/rate', async (req, res) => {
         return res.status(200).send('OK');
     }
  
-    // ── Guard 2: Deduplicate — if same ticket seen within 10 s, show thank-you page ──
-    // The scanner fires first, so the REAL user click is usually the duplicate.
-    // We must return proper HTML (with meta-refresh) so the user's tab redirects.
-    const duplicateLabel = checkDuplicate(ticketId, ratingLabel);
-    if (duplicateLabel !== null) {
-        logEvent('rating-request-duplicate', { ticketId: String(ticketId), rating: Number(rating) });
-        return res.status(200).send(buildAutoClosePage(`Rated ${duplicateLabel} — Thank you!`, false, Number(rating)));
-    }
- 
     try {
         // Fetch the ticket with requester details to get the contact email
         const ticketRes = await axios.get(
@@ -304,6 +299,33 @@ app.get('/rate', async (req, res) => {
         );
        
         const contactEmail = ticketRes.data?.requester?.email || "unknown";
+        ({ interactionId, interactionNumber } = await getLatestAgentInteraction(ticketId));
+        ratingRequestKey = `${ticketId}:${interactionId}:${rating}`;
+        const duplicateLabel = checkDuplicate(ticketId, interactionId, ratingLabel);
+
+        if (duplicateLabel !== null) {
+            logEvent('rating-request-duplicate', { ticketId: String(ticketId), interactionId, rating: Number(rating) });
+            return res.status(200).send(buildAutoClosePage(`Rated ${duplicateLabel} — Thank you!`, false, Number(rating)));
+        }
+
+        if (activeRatingRequests.has(ratingRequestKey)) {
+            logEvent('rating-request-duplicate-in-flight', { ticketId: String(ticketId), interactionId, rating: Number(rating) });
+            return res.status(200).send(buildAutoClosePage(`Rated ${ratingLabel} — Thank you!`, false, Number(rating)));
+        }
+        activeRatingRequests.add(ratingRequestKey);
+
+        const existingRatingRecord = await findExistingCustomObjectRecord({
+            data: {
+                ticket_id: String(ticketId),
+                interaction_id: interactionId,
+                final_rating: Number(rating)
+            }
+        });
+        if (existingRatingRecord) {
+            activeRatingRequests.delete(ratingRequestKey);
+            logEvent('rating-request-already-recorded', { ticketId: String(ticketId), interactionId, rating: Number(rating) });
+            return res.status(200).send(buildAutoClosePage(`Rated ${ratingLabel} — Thank you!`, false, Number(rating)));
+        }
  
         // Submit CSAT response as required by Freshdesk
         const payload = {
@@ -339,7 +361,6 @@ app.get('/rate', async (req, res) => {
             }
         );
  
-        const { interactionId, interactionNumber } = await getLatestAgentInteraction(ticketId);
         logEvent('interaction-resolved', { ticketId: String(ticketId), interactionId, interactionNumber });
         const customObjectPayload = {
             data: {
@@ -410,6 +431,7 @@ app.get('/rate', async (req, res) => {
             overallTicketAverage,
             recordUpdatedTime: savedRecord?.updated_time || null
         });
+        activeRatingRequests.delete(ratingRequestKey);
  
         return res
             .status(200)
@@ -417,12 +439,19 @@ app.get('/rate', async (req, res) => {
  
     } catch (err) {
         // Allow the user to retry after a failed Freshdesk request.
-        dedupLocks.delete(ticketId);
+        if (interactionId) {
+            dedupLocks.delete(`${ticketId}:${interactionId}:${ratingLabel}`);
+        }
         logEvent('rating-processing-failed', {
             ticketId: String(ticketId),
             rating: Number(rating),
             error: err.response?.data || err.message
         });
+        for (const requestKey of activeRatingRequests) {
+            if (requestKey.startsWith(`${ticketId}:`)) {
+                activeRatingRequests.delete(requestKey);
+            }
+        }
         return res.status(500).send('Something went wrong, please try again.');
     }
 });
