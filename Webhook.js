@@ -175,9 +175,6 @@ async function saveCustomObjectRecord(payload, existingRecord = null) {
         return updateResponse.data;
     }
 
-    let interactionId;
-    let interactionNumber;
-    let ratingRequestKey;
     try {
         const createResponse = await axios.post(recordsUrl, payload, requestConfig);
         return createResponse.data;
@@ -276,7 +273,9 @@ app.get('/rate', async (req, res) => {
         return res.status(400).send('Missing or invalid ticket id / rating. Rating must be 1–5.');
     }
 
-    logEvent('rating-requested', { ticketId: String(ticketId), rating: Number(rating) });
+    const requestId = `${ticketId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let processingStage = 'request-received';
+    logEvent('rating-requested', { requestId, ticketId: String(ticketId), rating: Number(rating) });
  
     // ── Guard 1: Silently drop known email-scanner bots (they don't render HTML) ──
     if (isBotRequest(req)) {
@@ -288,8 +287,12 @@ app.get('/rate', async (req, res) => {
         return res.status(200).send('OK');
     }
  
+    let interactionId;
+    let interactionNumber;
+    let ratingRequestKey;
     try {
         // Fetch the ticket with requester details to get the contact email
+        processingStage = 'fetch-ticket';
         const ticketRes = await axios.get(
             `https://${FRESHDESK_DOMAIN}/api/v2/tickets/${ticketId}?include=requester`,
             {
@@ -299,6 +302,7 @@ app.get('/rate', async (req, res) => {
         );
        
         const contactEmail = ticketRes.data?.requester?.email || "unknown";
+        processingStage = 'resolve-interaction';
         ({ interactionId, interactionNumber } = await getLatestAgentInteraction(ticketId));
         ratingRequestKey = `${ticketId}:${interactionId}:${rating}`;
         const duplicateLabel = checkDuplicate(ticketId, interactionId, ratingLabel);
@@ -314,6 +318,7 @@ app.get('/rate', async (req, res) => {
         }
         activeRatingRequests.add(ratingRequestKey);
 
+        processingStage = 'check-existing-record';
         const existingRatingRecord = await findExistingCustomObjectRecord({
             data: {
                 ticket_id: String(ticketId),
@@ -328,6 +333,7 @@ app.get('/rate', async (req, res) => {
         }
  
         // Submit CSAT response as required by Freshdesk
+        processingStage = 'save-csat-response';
         const payload = {
             ticket_id: Number(ticketId),
             answers: [
@@ -348,6 +354,7 @@ app.get('/rate', async (req, res) => {
         );
         logEvent('csat-response-saved', { ticketId: String(ticketId), rating: Number(rating) });
 
+        processingStage = 'update-ticket-rating';
         await axios.put(
             `https://${FRESHDESK_DOMAIN}/api/v2/tickets/${ticketId}`,
             {
@@ -371,6 +378,7 @@ app.get('/rate', async (req, res) => {
                 source: 'Email'
             }
         };
+        processingStage = 'build-custom-object-record';
         const ticketRecordsBeforeSave = (await getCustomObjectRecords()).filter(record => {
             const recordData = record.data || record;
             return String(recordData.ticket_id) === String(ticketId)
@@ -392,6 +400,7 @@ app.get('/rate', async (req, res) => {
         };
         const existingRecord = await findExistingCustomObjectRecord(recordPayload);
 
+        processingStage = 'save-custom-object-record';
         const savedRecord = await saveCustomObjectRecord(recordPayload, existingRecord);
         logEvent(existingRecord ? 'custom-object-record-updated' : 'custom-object-record-created', {
             ticketId: String(ticketId),
@@ -412,6 +421,7 @@ app.get('/rate', async (req, res) => {
             ? Math.round(interactionRatings.reduce((total, value) => total + value, 0) / interactionRatings.length)
             : null;
 
+        processingStage = 'update-ticket-average';
         await axios.put(
             `https://${FRESHDESK_DOMAIN}/api/v2/tickets/${ticketId}`,
             {
@@ -443,9 +453,12 @@ app.get('/rate', async (req, res) => {
             dedupLocks.delete(`${ticketId}:${interactionId}:${ratingLabel}`);
         }
         logEvent('rating-processing-failed', {
+            requestId,
             ticketId: String(ticketId),
+            interactionId: interactionId || null,
+            stage: processingStage,
             rating: Number(rating),
-            error: err.response?.data || err.message
+            error: err.response?.data || err.message || String(err)
         });
         for (const requestKey of activeRatingRequests) {
             if (requestKey.startsWith(`${ticketId}:`)) {
