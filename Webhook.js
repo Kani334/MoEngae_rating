@@ -9,6 +9,21 @@ const CUSTOM_OBJECT_SCHEMA_ID = process.env.CUSTOM_OBJECT_SCHEMA_ID;
 
 const MAX_RATE_LIMIT_RETRIES = 3;
 const DEFAULT_RATE_LIMIT_DELAY_MS = 1000;
+const EVENT_LOG_LIMIT = 200;
+const eventLog = [];
+
+function logEvent(event, details = {}) {
+    const entry = {
+        timestamp: new Date().toISOString(),
+        event,
+        ...details
+    };
+    eventLog.push(entry);
+    if (eventLog.length > EVENT_LOG_LIMIT) {
+        eventLog.shift();
+    }
+    console.log(JSON.stringify(entry));
+}
 
 function wait(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -82,6 +97,14 @@ app.get('/', (req, res) => {
     res.status(200).send('MoEngage rating webhook is running.');
 });
 
+app.get('/events', (req, res) => {
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+        ? Math.min(requestedLimit, EVENT_LOG_LIMIT)
+        : EVENT_LOG_LIMIT;
+    res.status(200).json(eventLog.slice(-limit));
+});
+
 async function getLatestAgentInteraction(ticketId) {
     const conversationsResponse = await axios.get(
         `https://${FRESHDESK_DOMAIN}/api/v2/tickets/${ticketId}/conversations?per_page=100`,
@@ -128,7 +151,8 @@ async function findExistingCustomObjectRecord(payload) {
     return records.find(record => {
         const recordData = record.data || record;
         return String(recordData.ticket_id) === String(payload.data.ticket_id)
-            && String(recordData.interaction_id) === String(payload.data.interaction_id);
+            && String(recordData.interaction_id) === String(payload.data.interaction_id)
+            && Number(recordData.final_rating) === Number(payload.data.final_rating);
     }) || null;
 }
 
@@ -247,10 +271,16 @@ app.get('/rate', async (req, res) => {
     if (!ticketId || !ratingLabel) {
         return res.status(400).send('Missing or invalid ticket id / rating. Rating must be 1–5.');
     }
+
+    logEvent('rating-requested', { ticketId: String(ticketId), rating: Number(rating) });
  
     // ── Guard 1: Silently drop known email-scanner bots (they don't render HTML) ──
     if (isBotRequest(req)) {
-        console.log(`[${new Date().toISOString()}] Ignored bot/scanner request for ticket ${ticketId} (UA: ${req.headers['user-agent']})`);
+        logEvent('rating-request-ignored', {
+            ticketId: String(ticketId),
+            reason: 'bot-or-scanner',
+            userAgent: req.headers['user-agent'] || ''
+        });
         return res.status(200).send('OK');
     }
  
@@ -259,7 +289,7 @@ app.get('/rate', async (req, res) => {
     // We must return proper HTML (with meta-refresh) so the user's tab redirects.
     const duplicateLabel = checkDuplicate(ticketId, ratingLabel);
     if (duplicateLabel !== null) {
-        console.log(`[${new Date().toISOString()}] Duplicate request for ticket ${ticketId} suppressed — showing thank-you page.`);
+        logEvent('rating-request-duplicate', { ticketId: String(ticketId), rating: Number(rating) });
         return res.status(200).send(buildAutoClosePage(`Rated ${duplicateLabel} — Thank you!`, false, Number(rating)));
     }
  
@@ -294,6 +324,7 @@ app.get('/rate', async (req, res) => {
                 headers: { 'Content-Type': 'application/json' }
             }
         );
+        logEvent('csat-response-saved', { ticketId: String(ticketId), rating: Number(rating) });
 
         await axios.put(
             `https://${FRESHDESK_DOMAIN}/api/v2/tickets/${ticketId}`,
@@ -308,19 +339,17 @@ app.get('/rate', async (req, res) => {
             }
         );
  
-        // Use the latest private note as the agent interaction identity.
         const { interactionId, interactionNumber } = await getLatestAgentInteraction(ticketId);
+        logEvent('interaction-resolved', { ticketId: String(ticketId), interactionId, interactionNumber });
         const customObjectPayload = {
             data: {
-                name: `Rating-${ticketId}-${interactionId}`,
+            name: `${rating}Email${interactionId}`,
                 interaction_id: interactionId,
                 interaction_number: interactionNumber,
                 ticket_id: String(ticketId),
                 source: 'Email'
             }
         };
- 
-        const existingRecord = await findExistingCustomObjectRecord(customObjectPayload);
         const ticketRecordsBeforeSave = (await getCustomObjectRecords()).filter(record => {
             const recordData = record.data || record;
             return String(recordData.ticket_id) === String(ticketId)
@@ -332,15 +361,24 @@ app.get('/rate', async (req, res) => {
             .filter(Number.isFinite)
             .concat(Number(rating))
             .join(', ');
-
-        const savedRecord = await saveCustomObjectRecord({
+        const recordPayload = {
             ...customObjectPayload,
             data: {
                 ...customObjectPayload.data,
                 ratings_given: ratingsGiven,
                 final_rating: Number(rating)
             }
-        }, existingRecord);
+        };
+        const existingRecord = await findExistingCustomObjectRecord(recordPayload);
+
+        const savedRecord = await saveCustomObjectRecord(recordPayload, existingRecord);
+        logEvent(existingRecord ? 'custom-object-record-updated' : 'custom-object-record-created', {
+            ticketId: String(ticketId),
+            interactionId,
+            interactionNumber,
+            rating: Number(rating),
+            recordId: savedRecord?.display_id || savedRecord?.id || null
+        });
 
         const ticketRecords = (await getCustomObjectRecords()).filter(record => {
             const recordData = record.data || record;
@@ -366,7 +404,12 @@ app.get('/rate', async (req, res) => {
             }
         );
  
-        console.log(`[${new Date().toISOString()}] Ticket ${ticketId} updated with CSAT and custom object rating "${ratingLabel}" (record updated_time: ${savedRecord?.updated_time || 'created now'})`);
+        logEvent('rating-processing-complete', {
+            ticketId: String(ticketId),
+            rating: Number(rating),
+            overallTicketAverage,
+            recordUpdatedTime: savedRecord?.updated_time || null
+        });
  
         return res
             .status(200)
@@ -375,7 +418,11 @@ app.get('/rate', async (req, res) => {
     } catch (err) {
         // Allow the user to retry after a failed Freshdesk request.
         dedupLocks.delete(ticketId);
-        console.error(`[${new Date().toISOString()}] Failed to process ticket ${ticketId}:`, err.response?.data || err.message);
+        logEvent('rating-processing-failed', {
+            ticketId: String(ticketId),
+            rating: Number(rating),
+            error: err.response?.data || err.message
+        });
         return res.status(500).send('Something went wrong, please try again.');
     }
 });
