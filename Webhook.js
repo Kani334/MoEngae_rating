@@ -135,7 +135,7 @@ async function getAgentInteraction(ticketId, requestedInteractionId) {
         : agentInteractions.findIndex(interaction => String(interaction.id) === String(requestedInteractionId));
     const selectedInteraction = exactInteraction || agentInteractions[selectedInteractionIndex];
 
-    const interactionId = Number(selectedInteraction?.id);
+    const interactionId = Number(selectedInteraction?.id ?? requestedId);
     if (!Number.isInteger(interactionId)) {
         throw new Error(requestedId === null
             ? `No agent reply found for ticket ${ticketId}`
@@ -359,29 +359,45 @@ app.get('/rate', async (req, res) => {
             ]
         };
  
-        await axios.post(
-            `https://${FRESHDESK_DOMAIN}/api/v2/customer-satisfaction/surveys/${SURVEY_ID}/responses`,
-            payload,
-            {
-                auth: { username: API_KEY, password: 'X' },
-                headers: { 'Content-Type': 'application/json' }
-            }
-        );
-        logEvent('csat-response-saved', { ticketId: String(ticketId), rating: Number(rating) });
+        try {
+            await axios.post(
+                `https://${FRESHDESK_DOMAIN}/api/v2/customer-satisfaction/surveys/${SURVEY_ID}/responses`,
+                payload,
+                {
+                    auth: { username: API_KEY, password: 'X' },
+                    headers: { 'Content-Type': 'application/json' }
+                }
+            );
+            logEvent('csat-response-saved', { ticketId: String(ticketId), rating: Number(rating) });
+        } catch (err) {
+            logEvent('csat-response-failed', {
+                ticketId: String(ticketId),
+                rating: Number(rating),
+                error: err.response?.data || err.message || String(err)
+            });
+        }
 
         processingStage = 'update-ticket-rating';
-        await axios.put(
-            `https://${FRESHDESK_DOMAIN}/api/v2/tickets/${ticketId}`,
-            {
-                custom_fields: {
-                    cf_csat_rating: String(rating)
+        try {
+            await axios.put(
+                `https://${FRESHDESK_DOMAIN}/api/v2/tickets/${ticketId}`,
+                {
+                    custom_fields: {
+                        cf_csat_rating: String(rating)
+                    }
+                },
+                {
+                    auth: { username: API_KEY, password: 'X' },
+                    headers: { 'Content-Type': 'application/json' }
                 }
-            },
-            {
-                auth: { username: API_KEY, password: 'X' },
-                headers: { 'Content-Type': 'application/json' }
-            }
-        );
+            );
+        } catch (err) {
+            logEvent('ticket-rating-update-failed', {
+                ticketId: String(ticketId),
+                rating: Number(rating),
+                error: err.response?.data || err.message || String(err)
+            });
+        }
  
         logEvent('interaction-resolved', { ticketId: String(ticketId), interactionId, interactionNumber });
         const customObjectPayload = {
