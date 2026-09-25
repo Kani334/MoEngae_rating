@@ -381,14 +381,14 @@ app.get('/rate', async (req, res) => {
         processingStage = 'build-custom-object-record';
         const ticketRecordsBeforeSave = (await getCustomObjectRecords()).filter(record => {
             const recordData = record.data || record;
-            return String(recordData.ticket_id) === String(ticketId)
-                && String(recordData.interaction_id) !== String(interactionId);
+            return String(recordData.ticket_id) === String(ticketId);
         });
         const ratingsGiven = ticketRecordsBeforeSave
             .sort((first, second) => Number((first.data || first).interaction_number) - Number((second.data || second).interaction_number))
             .map(record => Number((record.data || record).final_rating))
             .filter(Number.isFinite)
-            .concat(Number(rating))
+            .reverse()
+            .reduce((ratings, previousRating) => ratings.concat(previousRating), [Number(rating)])
             .join(', ');
         const recordPayload = {
             ...customObjectPayload,
