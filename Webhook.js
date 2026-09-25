@@ -106,7 +106,7 @@ app.get('/events', (req, res) => {
     res.status(200).json(eventLog.slice(-limit));
 });
 
-async function getLatestAgentInteraction(ticketId) {
+async function getAgentInteraction(ticketId, requestedInteractionId) {
     const conversationsResponse = await axios.get(
         `https://${FRESHDESK_DOMAIN}/api/v2/tickets/${ticketId}/conversations?per_page=100`,
         {
@@ -120,16 +120,31 @@ async function getLatestAgentInteraction(ticketId) {
     const agentInteractions = conversations
         .filter(conversation => conversation.private === false && conversation.incoming !== true)
         .sort((first, second) => new Date(first.created_at) - new Date(second.created_at));
-    const latestAgentInteraction = agentInteractions[agentInteractions.length - 1];
+    const requestedId = requestedInteractionId === undefined || requestedInteractionId === ''
+        ? null
+        : Number(requestedInteractionId);
+    if (requestedId !== null && !Number.isInteger(requestedId)) {
+        throw new Error(`Invalid interaction id for ticket ${ticketId}`);
+    }
 
-    const interactionId = Number(latestAgentInteraction?.id);
+    const exactInteraction = requestedId === null
+        ? null
+        : conversations.find(interaction => String(interaction.id) === String(requestedInteractionId));
+    const selectedInteractionIndex = requestedId === null
+        ? agentInteractions.length - 1
+        : agentInteractions.findIndex(interaction => String(interaction.id) === String(requestedInteractionId));
+    const selectedInteraction = exactInteraction || agentInteractions[selectedInteractionIndex];
+
+    const interactionId = Number(selectedInteraction?.id);
     if (!Number.isInteger(interactionId)) {
-        throw new Error(`No agent reply found for ticket ${ticketId}`);
+        throw new Error(requestedId === null
+            ? `No agent reply found for ticket ${ticketId}`
+            : `Interaction ${requestedId} was not found for ticket ${ticketId}`);
     }
 
     return {
         interactionId,
-        interactionNumber: agentInteractions.length
+        interactionNumber: selectedInteractionIndex >= 0 ? selectedInteractionIndex + 1 : agentInteractions.length + 1
     };
 }
 
@@ -152,8 +167,7 @@ async function findExistingCustomObjectRecord(payload) {
     return records.find(record => {
         const recordData = record.data || record;
         return String(recordData.ticket_id) === String(payload.data.ticket_id)
-            && String(recordData.interaction_id) === String(payload.data.interaction_id)
-            && Number(recordData.final_rating) === Number(payload.data.final_rating);
+            && String(recordData.interaction_id) === String(payload.data.interaction_id);
     }) || null;
 }
 
@@ -265,6 +279,7 @@ function buildAutoClosePage(message, isAlreadyRated = false, rating = 0) {
 app.get('/rate', async (req, res) => {
     const ticketId = req.query.t;
     const rating   = req.query.r;
+    const requestedInteractionId = req.query.i ?? req.query.interaction_id ?? req.query.interactionId;
  
     // Convert numeric param to dropdown label (e.g. "3" → "3 Stars")
     const ratingLabel = RATING_MAP[String(rating)];
@@ -303,7 +318,7 @@ app.get('/rate', async (req, res) => {
        
         const contactEmail = ticketRes.data?.requester?.email || "unknown";
         processingStage = 'resolve-interaction';
-        ({ interactionId, interactionNumber } = await getLatestAgentInteraction(ticketId));
+        ({ interactionId, interactionNumber } = await getAgentInteraction(ticketId, requestedInteractionId));
         ratingRequestKey = `${ticketId}:${interactionId}:${rating}`;
         const duplicateLabel = checkDuplicate(ticketId, interactionId, ratingLabel);
 
@@ -381,7 +396,8 @@ app.get('/rate', async (req, res) => {
         processingStage = 'build-custom-object-record';
         const ticketRecordsBeforeSave = (await getCustomObjectRecords()).filter(record => {
             const recordData = record.data || record;
-            return String(recordData.ticket_id) === String(ticketId);
+            return String(recordData.ticket_id) === String(ticketId)
+                && String(recordData.interaction_id) !== String(interactionId);
         });
         const ratingsGiven = ticketRecordsBeforeSave
             .sort((first, second) => Number((first.data || first).interaction_number) - Number((second.data || second).interaction_number))
